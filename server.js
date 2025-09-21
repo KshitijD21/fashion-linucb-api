@@ -147,8 +147,7 @@ async function connectToDatabase() {
 // ROUTE IMPORTS
 // =====================================
 
-// TODO: Import route handlers
-// import recommendationRoutes from './routes/recommendations.js';
+import recommendationRoutes from './routes/recommendations.js';
 // import feedbackRoutes from './routes/feedback.js';
 // import itemRoutes from './routes/items.js';
 // import sessionRoutes from './routes/sessions.js';
@@ -245,11 +244,8 @@ app.get('/api', (req, res) => {
     });
 });
 
-// TODO: Mount API routes
-// app.use('/api/v1/recommendations', recommendationRoutes);
-// app.use('/api/v1/feedback', feedbackRoutes);
-// app.use('/api/v1/items', itemRoutes);
-// app.use('/api/v1/sessions', sessionRoutes);
+// Mount API routes
+app.use('/api', recommendationRoutes);
 
 // =====================================
 // DEBUG ROUTES (Development Only)
