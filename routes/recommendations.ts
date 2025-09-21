@@ -239,11 +239,19 @@ router.get('/recommend/:sessionId', requireDatabase, validateRecommendationReque
             return;
         }
 
-        // Create cache key from filters
-        const filters = { minPrice, maxPrice, category, limit };
+        // Create cache key from filters and session state
+        // CRITICAL: Include session history count to ensure cache invalidation when products are shown
+        const currentSessionHistory = await getSessionHistory(collections!.session_history, sessionId!);
+        const historyCount = currentSessionHistory.length;
 
-        // Check cache first
-        const cachedResult = recommendationCache.get(sessionId!, filters, 1);
+        const filters = { minPrice, maxPrice, category, limit, historyCount };
+
+        // TEMPORARILY DISABLE CACHING FOR RECOMMENDATIONS
+        // Caching recommendations is problematic because:
+        // 1. Each recommendation should be unique
+        // 2. Session history changes after each recommendation
+        // 3. Exclusion logic requires fresh candidate selection
+        const cachedResult = null; // recommendationCache.get(sessionId!, filters, 1);
         if (cachedResult) {
             console.log(`💾 Cache hit for session ${sessionId}`);
             res.json(cachedResult);
@@ -466,8 +474,9 @@ router.get('/recommend/:sessionId', requireDatabase, validateRecommendationReque
             }
         };
 
-        // Cache the result for future requests (TTL: 5 minutes for single recommendations)
-        recommendationCache.set(sessionId!, filters, 1, response, 300000);
+        // DO NOT CACHE RECOMMENDATIONS - each should be unique
+        // Recommendations must be generated fresh for proper exclusion logic
+        // recommendationCache.set(sessionId!, filters, 1, response, 300000);
 
         console.log(`✅ Enhanced recommendation generated: ${selectedRecommendation.product.name} (score: ${selectedRecommendation.finalScore.toFixed(3)})`);
         res.json(response);

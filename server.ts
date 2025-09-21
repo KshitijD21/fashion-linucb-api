@@ -15,6 +15,14 @@ import morgan from 'morgan';
 dotenv.config();
 
 // =====================================
+// CONFIGURATION
+// =====================================
+
+// Database cleanup configuration
+const ENABLE_AUTO_CLEANUP = process.env.ENABLE_AUTO_CLEANUP !== 'false'; // Default: true
+const CLEANUP_SKIP_IN_PRODUCTION = process.env.CLEANUP_SKIP_IN_PRODUCTION === 'true'; // Default: false
+
+// =====================================
 // TYPE DEFINITIONS
 // =====================================
 
@@ -207,6 +215,71 @@ async function setupDatabaseIndexes(collections: {
     } catch (error) {
         console.error('❌ Index creation failed:', error);
         // Don't throw - indexes might already exist
+    }
+}
+
+/**
+ * Automatic Database Cleanup on Server Startup
+ * Clears all ML-related collections to ensure fresh algorithm training
+ */
+async function cleanupDatabase(collections: {
+    products: Collection;
+    user_sessions: Collection;
+    interactions: Collection;
+    session_history: Collection;
+}): Promise<void> {
+    try {
+        console.log('🧹 Starting automatic database cleanup...');
+
+        // Get current document counts for reporting
+        const [sessionHistoryCount, userSessionsCount, interactionsCount] = await Promise.all([
+            collections.session_history.countDocuments(),
+            collections.user_sessions.countDocuments(),
+            collections.interactions.countDocuments()
+        ]);
+
+        console.log('📊 Current ML data before cleanup:');
+        console.log(`   • Session History: ${sessionHistoryCount} documents`);
+        console.log(`   • User Sessions: ${userSessionsCount} documents`);
+        console.log(`   • Interactions: ${interactionsCount} documents`);
+
+        // Clear ML-related collections while preserving products
+        const cleanupOperations = [
+            {
+                name: 'session_history',
+                operation: collections.session_history.deleteMany({})
+            },
+            {
+                name: 'user_sessions',
+                operation: collections.user_sessions.deleteMany({})
+            },
+            {
+                name: 'interactions',
+                operation: collections.interactions.deleteMany({})
+            }
+        ];
+
+        // Execute cleanup operations
+        console.log('🗑️  Clearing ML training data...');
+        for (const cleanup of cleanupOperations) {
+            try {
+                const result = await cleanup.operation;
+                console.log(`   ✅ ${cleanup.name}: ${result.deletedCount} documents removed`);
+            } catch (error) {
+                console.warn(`   ⚠️  ${cleanup.name}: cleanup failed -`, (error as Error).message);
+            }
+        }
+
+        // Verify products collection is preserved
+        const productsCount = await collections.products.countDocuments();
+        console.log(`📦 Products collection preserved: ${productsCount} products available`);
+
+        console.log('✅ Database cleanup completed successfully');
+        console.log('🧠 ML algorithms will start with fresh training data');
+
+    } catch (error) {
+        console.error('❌ Database cleanup failed:', error);
+        throw new Error(`Database cleanup error: ${(error as Error).message}`);
     }
 }
 
@@ -608,6 +681,29 @@ async function startServer(): Promise<void> {
         // Connect to database first
         await connectDatabase();
 
+        // Perform automatic database cleanup for fresh ML training
+        const { collections } = app.locals as AppLocals;
+        if (collections && ENABLE_AUTO_CLEANUP) {
+            // Check production environment safety
+            if (NODE_ENV === 'production' && CLEANUP_SKIP_IN_PRODUCTION) {
+                console.log('⚠️  Skipping database cleanup in production environment');
+                console.log('   Set CLEANUP_SKIP_IN_PRODUCTION=false to enable cleanup in production');
+            } else {
+                try {
+                    await cleanupDatabase(collections);
+                } catch (cleanupError) {
+                    console.error('❌ Database cleanup failed:', cleanupError);
+                    // Don't stop server startup for cleanup failures
+                    console.log('⚠️  Continuing server startup despite cleanup failure...');
+                }
+            }
+        } else if (!ENABLE_AUTO_CLEANUP) {
+            console.log('⚠️  Database auto-cleanup disabled via configuration');
+            console.log('   Set ENABLE_AUTO_CLEANUP=true to enable automatic cleanup');
+        } else {
+            console.warn('⚠️  Skipping database cleanup - collections not available');
+        }
+
         // Start HTTP server on all interfaces (0.0.0.0) for mobile connectivity
         const HOST = process.env.HOST || '0.0.0.0';
         app.listen(PORT, HOST, () => {
@@ -623,6 +719,10 @@ async function startServer(): Promise<void> {
             console.log('================================');
             console.log('✅ Fashion LinUCB API Ready! 🚀');
             console.log('📱 Mobile apps can connect using the Mobile URL above');
+
+            if (ENABLE_AUTO_CLEANUP && !(NODE_ENV === 'production' && CLEANUP_SKIP_IN_PRODUCTION)) {
+                console.log('🧠 ML algorithms initialized with fresh training data');
+            }
 
             if (NODE_ENV === 'development') {
                 console.log('🔧 Development mode active');
