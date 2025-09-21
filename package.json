@@ -40,6 +40,7 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
+    "axios": "^1.12.2",
     "compression": "^1.7.4",
     "connect-mongo": "^5.1.0",
     "cors": "^2.8.5",

@@ -6,7 +6,6 @@ import compression from 'compression';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import express, { ErrorRequestHandler, NextFunction, Request, Response } from 'express';
-import rateLimit from 'express-rate-limit';
 import session from 'express-session';
 import helmet from 'helmet';
 import { Collection, Db, MongoClient } from 'mongodb';
@@ -25,6 +24,7 @@ interface AppLocals {
         products: Collection;
         user_sessions: Collection;
         interactions: Collection;
+        session_history: Collection;
     } | null;
 }
 
@@ -56,6 +56,26 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 // MIDDLEWARE SETUP
 // =====================================
 
+// Import enhanced middleware
+import { enhancedDuplicateDetection, getDuplicateStats, resetDuplicateDetection } from './middleware/enhancedDuplicateDetection.js';
+import {
+    getPerformanceMetrics,
+    getSystemHealth,
+    performanceMonitoring,
+    usagePatternLogger
+} from './middleware/monitoring.js';
+import { enhancedRateLimit, rateLimitConfigs } from './middleware/rateLimiting.js';
+import {
+    sanitizeRequest
+} from './middleware/validation.js';
+import {
+    apiVersioning,
+    deprecationWarning,
+    getVersionInfo,
+    versionedResponse
+} from './middleware/versioning.js';
+import { recommendationCache } from './utils/caching.js';
+
 // Security middleware
 if (process.env.ENABLE_HELMET !== 'false') {
     app.use(helmet({
@@ -82,24 +102,35 @@ const corsOptions: cors.CorsOptions = {
         : ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:5173'],
     credentials: process.env.CORS_CREDENTIALS === 'true',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'API-Version', 'Accept'],
 };
 app.use(cors(corsOptions));
 
-// Rate limiting
-const limiter = rateLimit({
-    windowMs: (parseInt(process.env.RATE_LIMIT_WINDOW || '15', 10)) * 60 * 1000, // minutes to ms
-    max: parseInt(process.env.RATE_LIMIT_REQUESTS || '100', 10),
-    message: {
-        success: false,
-        error: 'Rate limit exceeded',
-        message: 'Too many requests, please try again later.',
-        retryAfter: '15 minutes'
-    },
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-app.use('/api/', limiter);
+// Request sanitization
+app.use(sanitizeRequest);
+
+// API versioning (applied before rate limiting to support version-specific limits)
+app.use('/api', apiVersioning as any);
+app.use('/api', versionedResponse as any);
+app.use('/api', deprecationWarning as any);
+
+// Enhanced rate limiting with different limits per endpoint type
+app.use('/api/session', enhancedRateLimit('session'));
+app.use('/api/recommend', enhancedRateLimit('recommendations'));
+app.use('/api/feedback', enhancedRateLimit('feedback'));
+app.use('/api/batch', enhancedRateLimit('batch'));
+app.use('/api/recommendations/batch', enhancedRateLimit('batch'));
+app.use('/api/feedback/batch', enhancedRateLimit('batch'));
+
+// General rate limiting for other endpoints
+app.use('/api/', rateLimitConfigs.general);
+
+// Performance monitoring and usage logging
+app.use(performanceMonitoring);
+app.use(usagePatternLogger);
+
+// Duplicate request prevention
+app.use(enhancedDuplicateDetection);
 
 // Logging middleware
 if (NODE_ENV === 'development') {
@@ -133,6 +164,52 @@ app.locals.collections = null;
 
 let client: MongoClient;
 
+async function setupDatabaseIndexes(collections: {
+    products: Collection;
+    user_sessions: Collection;
+    interactions: Collection;
+    session_history: Collection;
+}): Promise<void> {
+    try {
+        console.log('📊 Setting up database indexes...');
+
+        // Helper function to create index safely
+        const createIndexSafely = async (collection: Collection, indexSpec: any, options?: any) => {
+            try {
+                await collection.createIndex(indexSpec, options);
+            } catch (error: any) {
+                if (error.code === 86) {
+                    // Index already exists, ignore
+                    console.log(`⚠️ Index already exists: ${JSON.stringify(indexSpec)}`);
+                } else {
+                    throw error;
+                }
+            }
+        };
+
+        // Session history indexes for optimal query performance
+        await createIndexSafely(collections.session_history, { session_id: 1 });
+        await createIndexSafely(collections.session_history, { product_id: 1 });
+        await createIndexSafely(collections.session_history, { session_id: 1, shown_at: -1 });
+        await createIndexSafely(collections.session_history, { shown_at: -1 });
+
+        // Additional indexes for existing collections (if not already exist)
+        await createIndexSafely(collections.products, { product_id: 1 });
+        await createIndexSafely(collections.products, { category_main: 1 });
+        await createIndexSafely(collections.products, { primary_color: 1 });
+        await createIndexSafely(collections.products, { brand: 1 });
+        await createIndexSafely(collections.products, { price: 1 });
+
+        await createIndexSafely(collections.user_sessions, { session_id: 1 });
+        await createIndexSafely(collections.interactions, { session_id: 1 });
+
+        console.log('✅ Database indexes created successfully');
+    } catch (error) {
+        console.error('❌ Index creation failed:', error);
+        // Don't throw - indexes might already exist
+    }
+}
+
 async function connectDatabase(): Promise<void> {
     try {
         console.log('📊 Connecting to MongoDB...');
@@ -151,12 +228,16 @@ async function connectDatabase(): Promise<void> {
         const collections = {
             products: db.collection('products'),
             user_sessions: db.collection('user_sessions'),
-            interactions: db.collection('interactions')
+            interactions: db.collection('interactions'),
+            session_history: db.collection('session_history')
         };
 
         // Store in app.locals for route access
         app.locals.db = db;
         app.locals.collections = collections;
+
+        // Create indexes for optimal performance
+        await setupDatabaseIndexes(collections);
 
         console.log('✅ MongoDB connected successfully');
 
@@ -269,6 +350,137 @@ app.get('/api', (req: Request, res: Response) => {
 
 // Mount API routes
 app.use('/api', recommendationRoutes);
+
+// =====================================
+// ENHANCED API ENDPOINTS
+// =====================================
+
+// API Version information
+app.get('/api/version', getVersionInfo);
+
+// Performance metrics endpoint
+app.get('/api/metrics', (req: Request, res: Response) => {
+    try {
+        const metrics = getPerformanceMetrics();
+        res.json({
+            success: true,
+            metrics
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Failed to get metrics',
+            message: (error as Error).message
+        });
+    }
+});
+
+// System health endpoint
+app.get('/api/health', (req: Request, res: Response) => {
+    try {
+        const health = getSystemHealth();
+        const statusCode = health.status === 'healthy' ? 200 : 503;
+        res.status(statusCode).json({
+            success: health.status === 'healthy',
+            health
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Health check failed',
+            message: (error as Error).message
+        });
+    }
+});
+
+// Cache statistics endpoint
+app.get('/api/cache/stats', (req: Request, res: Response) => {
+    try {
+        const stats = recommendationCache.getStats();
+        res.json({
+            success: true,
+            cache_stats: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Failed to get cache stats',
+            message: (error as Error).message
+        });
+    }
+});
+
+// Duplicate detection statistics endpoint
+app.get('/api/duplicate-detection/stats', (req: Request, res: Response) => {
+    try {
+        const stats = getDuplicateStats();
+        res.json({
+            success: true,
+            duplicate_detection: stats
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: 'Failed to get duplicate detection stats',
+            message: (error as Error).message
+        });
+    }
+});
+
+// Cache management endpoints (admin only in production)
+if (NODE_ENV === 'development' || process.env.ENABLE_CACHE_ADMIN === 'true') {
+    // Clear cache
+    app.post('/api/cache/clear', (req: Request, res: Response) => {
+        try {
+            recommendationCache.clear();
+            res.json({
+                success: true,
+                message: 'Cache cleared successfully'
+            });
+        } catch (error) {
+            res.status(500).json({
+                success: false,
+                error: 'Failed to clear cache',
+                message: (error as Error).message
+            });
+        }
+    });
+
+    // Reset duplicate detection (for testing)
+    app.post('/api/duplicate-detection/reset', (req: Request, res: Response) => {
+        try {
+            resetDuplicateDetection();
+            res.json({
+                success: true,
+                message: 'Duplicate detection records reset successfully'
+            });
+        } catch (error) {
+            res.status(500).json({
+                success: false,
+                error: 'Failed to reset duplicate detection',
+                message: (error as Error).message
+            });
+        }
+    });
+
+    // Invalidate session cache
+    app.post('/api/cache/invalidate/session/:sessionId', (req: Request, res: Response) => {
+        try {
+            const { sessionId } = req.params;
+            recommendationCache.invalidateSession(sessionId);
+            res.json({
+                success: true,
+                message: `Cache invalidated for session ${sessionId}`
+            });
+        } catch (error) {
+            res.status(500).json({
+                success: false,
+                error: 'Failed to invalidate session cache',
+                message: (error as Error).message
+            });
+        }
+    });
+}
 
 // =====================================
 // DEBUG ROUTES (Development Only)
