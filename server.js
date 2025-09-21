@@ -113,8 +113,35 @@ if (process.env.TRUST_PROXY === 'true') {
 // DATABASE CONNECTION
 // =====================================
 
-// TODO: Import and initialize database connection
-// import { connectToDatabase, initializeLinUCB } from './utils/database.js';
+import { MongoClient } from 'mongodb';
+
+// MongoDB connection
+let db, collections;
+const client = new MongoClient(process.env.MONGODB_URI);
+
+async function connectToDatabase() {
+    try {
+        console.log('📊 Connecting to MongoDB...');
+        await client.connect();
+        db = client.db(); // Use default database from connection string
+
+        collections = {
+            products: db.collection('products'),
+            models: db.collection('linucb_models'),
+            sessions: db.collection('user_sessions'),
+            interactions: db.collection('interactions')
+        };
+
+        // Make collections available to routes
+        app.locals.collections = collections;
+
+        console.log('✅ MongoDB connected successfully');
+        return true;
+    } catch (error) {
+        console.error('❌ MongoDB connection failed:', error);
+        return false;
+    }
+}
 
 // =====================================
 // ROUTE IMPORTS
@@ -143,6 +170,52 @@ app.get('/health', (req, res) => {
         },
     });
 });
+
+// Add after your existing routes
+app.get('/api/products/count', async (req, res) => {
+    try {
+        // Use collections from app.locals
+        const { collections } = req.app.locals;
+
+        if (!collections) {
+            return res.status(503).json({
+                success: false,
+                error: 'Database not connected'
+            });
+        }
+
+        const count = await collections.products.countDocuments();
+        const sample = await collections.products.findOne({});
+
+        if (!sample) {
+            return res.json({
+                success: true,
+                total_products: count,
+                message: 'No products found - run data loader first'
+            });
+        }
+
+        res.json({
+            success: true,
+            total_products: count,
+            sample_product: {
+                id: sample.product_id,
+                name: sample.name,
+                brand: sample.brand,
+                price: sample.price,
+                category: sample.category_main,
+                feature_vector_length: sample.feature_vector.length,
+                active_features: sample.feature_explanation
+            }
+        });
+    } catch (error) {
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 
 // API version info
 app.get('/api', (req, res) => {
@@ -263,27 +336,25 @@ async function startServer() {
     try {
         console.log('🚀 Starting Fashion LinUCB API Server...');
 
-        // TODO: Initialize database connection
-        // console.log('📊 Connecting to MongoDB...');
-        // await connectToDatabase();
-
-        // TODO: Initialize LinUCB algorithm
-        // console.log('🧠 Initializing LinUCB algorithm...');
-        // await initializeLinUCB();
-
-        // TODO: Load dataset if enabled
-        // if (process.env.AUTO_LOAD_DATASET === 'true') {
-        //     console.log('📁 Loading fashion dataset...');
-        //     await loadDataset();
-        // }
+        // Initialize database connection
+        console.log('📊 Connecting to MongoDB...');
+        const connected = await connectToDatabase();
+        if (!connected) {
+            console.error('❌ Failed to connect to database');
+            process.exit(1);
+        }
 
         // Start HTTP server
         app.listen(PORT, () => {
+            console.log('================================');
             console.log(`✅ Server running on port ${PORT}`);
             console.log(`🌍 Environment: ${NODE_ENV}`);
             console.log(`🔗 API URL: http://localhost:${PORT}`);
             console.log(`📚 Health Check: http://localhost:${PORT}/health`);
-            console.log(`📖 API Info: http://localhost:${PORT}/api`);
+            console.log(`� Products Count: http://localhost:${PORT}/api/products/count`);
+            console.log(`�📖 API Info: http://localhost:${PORT}/api`);
+            console.log('================================');
+            console.log('✅ Fashion LinUCB API Ready! 🚀');
 
             if (NODE_ENV === 'development') {
                 console.log('🔧 Development mode active');
@@ -300,13 +371,15 @@ async function startServer() {
 }
 
 // Handle graceful shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
     console.log('🛑 SIGTERM received, shutting down gracefully...');
+    await client.close();
     process.exit(0);
 });
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('🛑 SIGINT received, shutting down gracefully...');
+    await client.close();
     process.exit(0);
 });
 
